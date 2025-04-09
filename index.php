@@ -19,6 +19,13 @@ if (!$products) {
 }
 
 require 'header.php';
+
+// Afficher le message de bienvenue si existant
+if (!empty($_SESSION['welcome_message'])) {
+    echo '<div class="alert alert-success">' . $_SESSION['welcome_message'] . '</div>';
+    unset($_SESSION['welcome_message']); // Effacer le message après affichage
+}
+
 ?>
 
 

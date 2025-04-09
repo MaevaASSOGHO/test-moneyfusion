@@ -2,60 +2,84 @@
 require 'config.php';
 header('Content-Type: application/json');
 
+// 1. Vérifications de sécurité
 if (!isset($_SESSION['user_id']) || $_SERVER['REQUEST_METHOD'] !== 'POST') {
-    echo json_encode(['success' => false, 'error' => 'Accès non autorisé']);
+    http_response_code(403);
+    echo json_encode(['statut' => false, 'message' => 'Accès non autorisé']);
     exit;
 }
 
+// 2. Récupération du produit
 $productId = (int)$_POST['product_id'];
 $product = $db->query("SELECT * FROM products WHERE id = $productId")->fetch_assoc();
 
 if (!$product) {
-    echo json_encode(['success' => false, 'error' => 'Produit introuvable']);
+    http_response_code(404);
+    echo json_encode(['statut' => false, 'message' => 'Produit introuvable']);
     exit;
 }
 
-// Création de la commande
-$db->query("INSERT INTO orders (user_id, total_amount, status) 
-            VALUES ({$_SESSION['user_id']}, {$product['price']}, 'pending')");
-$orderId = $db->insert_id;
-
-// Préparation du paiement MoneyFusion
+// 3. Formatage pour MoneyFusion (selon leur doc)
 $paymentData = [
-    'amount' => $product['price'],
-    'currency' => APP_CURRENCY,
-    'order_id' => $orderId,
-    'description' => 'Achat: '.$product['name'],
-    'customer_id' => $_SESSION['user_id'],
-    'return_url' => MF_RETURN_URL,
-    'cancel_url' => MF_CANCEL_URL,
-    'timestamp' => time()
+    'totalPrice' => $product['price'],
+    'article' => [ [ $product['name'] => $product['price'] ], // Format exigé
+    'numeroSend' => $_SESSION['user_phone'] ?? '', // Obligatoire
+    'nomclient' => $_SESSION['user_name'] ?? '', // Obligatoire
+    'personal_Info' => [
+        'userId' => $_SESSION['user_id'],
+        'orderId' => 'BANTOU_' . uniqid()
+    ],
+    'return_url' => MF_RETURN_URL
 ];
 
-// Génération de la signature
-ksort($paymentData);
-$signatureString = http_build_query($paymentData);
-$paymentData['signature'] = hash_hmac('sha256', $signatureString, MF_API_SECRET);
-$paymentData['api_key'] = MF_API_KEY;
+// 4. Envoi à MoneyFusion via Axios (côté serveur)
+try {
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => MF_API_ENDPOINT,
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => json_encode($paymentData),
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => [
+            'Content-Type: application/json',
+            'Authorization: Bearer ' . MF_API_KEY
+        ]
+    ]);
 
-// Envoi à MoneyFusion
-$ch = curl_init();
-curl_setopt_array($ch, [
-    CURLOPT_URL => MF_API_ENDPOINT,
-    CURLOPT_POST => true,
-    CURLOPT_POSTFIELDS => http_build_query($paymentData),
-    CURLOPT_RETURNTRANSFER => true,
-    CURLOPT_HTTPHEADER => ['Content-Type: application/x-www-form-urlencoded']
-]);
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
 
-$response = curl_exec($ch);
-curl_close($ch);
+    // 5. Traitement réponse
+    $responseData = json_decode($response, true);
+    
+    if ($httpCode !== 200 || !isset($responseData['url'])) {
+        throw new Exception($responseData['message'] ?? 'Erreur API');
+    }
 
-$responseData = json_decode($response, true);
-if ($responseData && $responseData['payment_url']) {
-    // Sauvegarde l'ID de transaction MoneyFusion
-    $db->query("UPDATE orders SET moneyfusion_id = '{$responseData['transaction_id']}' WHERE id = $orderId");
-    echo json_encode(['success' => true, 'payment_url' => $responseData['payment_url']]);
-} else {
-    echo json_encode(['success' => false, 'error' => 'Erreur MoneyFusion']);
+    // 6. Sauvegarde en BDD (adaptée à votre structure)
+    $db->query("INSERT INTO orders 
+               (user_id, total_amount, status, moneyfusion_id) 
+               VALUES (
+                   {$_SESSION['user_id']}, 
+                   {$product['price']}, 
+                   'pending', 
+                   '{$responseData['token']}'
+               )");
+
+    // 7. Retour réussite (format MoneyFusion)
+    echo json_encode([
+        'statut' => true,
+        'token' => $responseData['token'],
+        'message' => 'Paiement initié',
+        'url' => $responseData['url']
+    ]);
+
+} catch (Exception $e) {
+    http_response_code(500);
+    echo json_encode([
+        'statut' => false,
+        'message' => 'Échec du paiement: ' . $e->getMessage()
+    ]);
 }
+?>
